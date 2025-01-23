@@ -423,7 +423,9 @@ class PPOTrainer(Trainer):
                 scores = []
                 sequence_lengths = []
                 values = []
-                with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+                with unwrap_model_for_generation(
+                    self.model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
+                ) as unwrapped_model:
                     query_responses, logitss = batch_generation(
                         unwrapped_model.policy,
                         queries,
@@ -702,7 +704,9 @@ class PPOTrainer(Trainer):
         )
 
         table = defaultdict(list)
-        with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
+        with unwrap_model_for_generation(
+            self.model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
+        ) as unwrapped_model:
             for batch in self.eval_dataloader:
                 query = batch["input_ids"]
                 with torch.no_grad():
