@@ -303,6 +303,9 @@ class RLOOTrainer(Trainer):
             data = next(iter_dataloader)
             with torch.no_grad():
                 queries = data["input_ids"].to(device)
+                # YIHAO ADDED DO NOT PUSH TO UPSTREAM UNLESS WE PROPOSE METADATA FEATURE
+                metadata = data["metadata"]
+                repeated_metadata = metadata * args.rloo_k
                 queries = queries.repeat(args.rloo_k, 1)
                 context_length = queries.shape[1]
                 responses = []
@@ -361,7 +364,8 @@ class RLOOTrainer(Trainer):
                     else:
                         score = torch.tensor(
                             reward_model(
-                                processing_class.batch_decode(postprocessed_query_response, skip_special_tokens=True)
+                                processing_class.batch_decode(postprocessed_query_response, skip_special_tokens=True),
+                                metadata=repeated_metadata[i:i + args.local_rollout_forward_batch_size]    # YIHAO ADDED DO NOT PUSH TO UPSTREAM UNLESS WE PROPOSE METADATA FEATURE
                             ),
                             dtype=torch.float,
                         ).to(device)
@@ -584,6 +588,7 @@ class RLOOTrainer(Trainer):
         ) as unwrapped_model:
             for batch in self.eval_dataloader:
                 query = batch["input_ids"]
+                metadata = batch["metadata"]                 # YIHAO ADDED DO NOT PUSH TO UPSTREAM UNLESS WE PROPOSE METADATA FEATURE
                 with torch.no_grad():
                     context_length = query.shape[1]
                     query_response, _ = batch_generation(
@@ -618,7 +623,8 @@ class RLOOTrainer(Trainer):
                     else:
                         score = torch.tensor(
                             self.reward_model(
-                                processing_class.batch_decode(postprocessed_query_response, skip_special_tokens=True)
+                                processing_class.batch_decode(postprocessed_query_response, skip_special_tokens=True),
+                                metadata=metadata,                # YIHAO ADDED DO NOT PUSH TO UPSTREAM UNLESS WE PROPOSE METADATA FEATURE
                             ),
                             dtype=torch.float,
                         ).to(postprocessed_query_response.device)
