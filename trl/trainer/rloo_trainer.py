@@ -54,7 +54,6 @@ from ..trainer.utils import (
     first_true_indices,
     forward,
     get_reward,
-    get_reward_custom, # YIHAO ADDED
     prepare_deepspeed,
     print_rich_table,
     truncate_response,
@@ -80,7 +79,7 @@ class RLOOTrainer(Trainer):
         ],
         policy: nn.Module,
         ref_policy: nn.Module,
-        reward_model: Union[nn.Module, Callable],
+        reward_model: Union[nn.Module, Callable[[list[str]], list[float]]],
         train_dataset: Dataset,
         data_collator: Optional[DataCollatorWithPadding] = None,
         eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
@@ -225,8 +224,6 @@ class RLOOTrainer(Trainer):
                 self.reward_model = prepare_deepspeed(
                     self.reward_model, args.per_device_train_batch_size, args.fp16, args.bf16
                 )
-            else:
-                print("YIHAO Note: `reward_model` is not an nn.Module. DeepSpeed will not be applied to it.")
             self.ref_policy = prepare_deepspeed(
                 self.ref_policy, args.per_device_train_batch_size, args.fp16, args.bf16
             )
@@ -234,7 +231,6 @@ class RLOOTrainer(Trainer):
         else:
             self.ref_policy = self.ref_policy.to(self.accelerator.device)
             if isinstance(self.reward_model, nn.Module):
-                
                 self.reward_model = self.reward_model.to(self.accelerator.device)
 
     def get_train_dataloader(self) -> DataLoader:
@@ -358,16 +354,19 @@ class RLOOTrainer(Trainer):
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
                     sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
 
-                    ### YIHAO ADDED
-                    if isinstance(self.reward_model, nn.Module):
+                    if isinstance(reward_model, nn.Module):
                         _, score, _ = get_reward(
-                            self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                            reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
                         )
                     else:
-                        score = get_reward_custom(
-                            self.reward_model, processing_class, postprocessed_query_response
-                            )
+                        score = torch.tensor(
+                            reward_model(
+                                processing_class.batch_decode(postprocessed_query_response, skip_special_tokens=True)
+                            ),
+                            dtype=torch.float,
+                        ).to(device)
 
+                    # Store batch results
                     responses.append(response)
                     postprocessed_responses.append(postprocessed_response)
                     logprobs.append(logprob)
@@ -608,15 +607,21 @@ class RLOOTrainer(Trainer):
                     )
 
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                    ### YIHAO ADDED
+
                     if isinstance(self.reward_model, nn.Module):
                         _, score, _ = get_reward(
-                            self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                            self.reward_model,
+                            postprocessed_query_response,
+                            processing_class.pad_token_id,
+                            context_length,
                         )
                     else:
-                        score = get_reward_custom(
-                            self.reward_model, processing_class, postprocessed_query_response
-                            )
+                        score = torch.tensor(
+                            self.reward_model(
+                                processing_class.batch_decode(postprocessed_query_response, skip_special_tokens=True)
+                            ),
+                            dtype=torch.float,
+                        ).to(postprocessed_query_response.device)
                     table["score"].extend(self.accelerator.gather_for_metrics(score).float().cpu().numpy())
 
                 if sampling:
