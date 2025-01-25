@@ -364,7 +364,7 @@ class RLOOTrainer(Trainer):
                     else:
                         score = torch.tensor(
                             reward_model(
-                                processing_class.batch_decode(postprocessed_query_response, skip_special_tokens=True),
+                                processing_class.batch_decode(postprocessed_response, skip_special_tokens=True),
                                 metadata=repeated_metadata[i:i + args.local_rollout_forward_batch_size]    # YIHAO ADDED DO NOT PUSH TO UPSTREAM UNLESS WE PROPOSE METADATA FEATURE
                             ),
                             dtype=torch.float,
@@ -623,7 +623,7 @@ class RLOOTrainer(Trainer):
                     else:
                         score = torch.tensor(
                             self.reward_model(
-                                processing_class.batch_decode(postprocessed_query_response, skip_special_tokens=True),
+                                processing_class.batch_decode(postprocessed_response, skip_special_tokens=True),
                                 metadata=metadata,                # YIHAO ADDED DO NOT PUSH TO UPSTREAM UNLESS WE PROPOSE METADATA FEATURE
                             ),
                             dtype=torch.float,
