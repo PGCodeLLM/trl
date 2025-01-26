@@ -67,6 +67,16 @@ if is_wandb_available():
 
 INVALID_LOGPROB = 1.0
 
+# Name of the files used for checkpointing
+TRAINING_ARGS_NAME = "training_args.bin"
+TRAINER_STATE_NAME = "trainer_state.json"
+OPTIMIZER_NAME = "optimizer.pt"
+OPTIMIZER_NAME_BIN = "optimizer.bin"
+SCHEDULER_NAME = "scheduler.pt"
+SCALER_NAME = "scaler.pt"
+FSDP_MODEL_NAME = "pytorch_model_fsdp"
+
+
 
 class RLOOTrainer(Trainer):
     _tag_names = ["trl", "rloo"]
@@ -239,7 +249,7 @@ class RLOOTrainer(Trainer):
     def get_eval_dataloader(self) -> DataLoader:
         return self.eval_dataloader
 
-    def train(self):
+    def train(self, resume_from_checkpoint: Optional[Union[str, bool]] = None,):
         args = self.args
         accelerator = self.accelerator
         optimizer = self.optimizer
@@ -250,6 +260,30 @@ class RLOOTrainer(Trainer):
         processing_class = self.processing_class
         dataloader = self.dataloader
         device = accelerator.device
+        if resume_from_checkpoint is False:
+            resume_from_checkpoint = None
+        from transformers.trainer_utils import get_last_checkpoint
+
+        # Load potential model checkpoint
+        if isinstance(resume_from_checkpoint, bool) and resume_from_checkpoint:
+            resume_from_checkpoint = get_last_checkpoint(args.output_dir)
+            if resume_from_checkpoint is None:
+                raise ValueError(f"No valid checkpoint found in output directory ({args.output_dir})")
+
+        if resume_from_checkpoint is not None:
+            # if not is_sagemaker_mp_enabled() and not self.is_deepspeed_enabled and not self.is_fsdp_enabled:
+            #     self._load_from_checkpoint(resume_from_checkpoint)
+            # In case of repeating the find_executable_batch_size, set `self._train_batch_size` properly
+            self.state = OnlineTrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
+            print(f'self state is process zero: {self.state.is_world_process_zero}')
+            print(f'self state is world process zero: {self.state.is_world_process_zero}')
+            is_local_process_zero=self.is_local_process_zero()
+            is_world_process_zero=self.is_world_process_zero()
+            self.state.is_local_process_zero = is_local_process_zero
+            self.state.is_world_process_zero = is_world_process_zero
+            print(f'self state is process zero: {is_local_process_zero=}, {is_world_process_zero=}')
+            # if state.train_batch_size is not None:
+            #     self._train_batch_size = state.train_batch_size
 
         def repeat_generator():
             while True:
@@ -274,12 +308,60 @@ class RLOOTrainer(Trainer):
         entropy_stats = torch.zeros(stats_shape, device=device)
         ratio_stats = torch.zeros(stats_shape, device=device)
         model.train()
+        from transformers.integrations.deepspeed import deepspeed_init, deepspeed_load_checkpoint, is_deepspeed_available
+
+        # ckpt loading
+        if resume_from_checkpoint is not None:
+            if self.is_deepspeed_enabled:
+                print('loading from checkpoint deepspeed')
+                deepspeed_load_checkpoint(
+                    self.model_wrapped, resume_from_checkpoint, load_module_strict=True)#not _is_peft_model(self.model)
+                #)
+            # elif is_sagemaker_mp_enabled() or self.is_fsdp_enabled:
+            #     self._load_from_checkpoint(resume_from_checkpoint, self.model_wrapped)
+
+        # Check if saved optimizer or scheduler states exist
+        self._load_optimizer_and_scheduler(resume_from_checkpoint)
 
         # trainer state initialization
         self.state.global_step = 0
         self.state.episode = 0
         self.state.max_steps = args.num_total_batches
         self.state.num_train_epochs = (args.total_episodes / args.rloo_k) / self.train_dataset_len
+
+        # Check if continuing training from a checkpoint
+        if resume_from_checkpoint is not None and os.path.isfile(
+            os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
+        ):
+            self.state = OnlineTrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
+            is_local_process_zero=self.is_local_process_zero()
+            is_world_process_zero=self.is_world_process_zero()
+            self.state.is_local_process_zero = is_local_process_zero
+            self.state.is_world_process_zero = is_world_process_zero
+            # self.compare_trainer_and_checkpoint_args(self.args, self.state)
+            self._load_callback_state()
+            epochs_trained = self.state.episode / (args.rloo_k * self.train_dataset_len)  # self.state.epoch = self.state.episode / (args.rloo_k * self.train_dataset_len) 
+            # epochs_trained = int(self.state.global_step // num_update_steps_per_epoch)
+            
+            print(f'epochs_trained: {epochs_trained}')
+            # len_dataloader = len(iter_dataloader)
+            # num_update_steps_per_epoch = len_dataloader // args.gradient_accumulation_steps
+            # print(f'assuming num_update_steps_per_epoch: {num_update_steps_per_epoch}')
+            # if not args.ignore_data_skip:
+            #     steps_trained_in_current_epoch = self.state.global_step % (num_update_steps_per_epoch)
+            #     steps_trained_in_current_epoch *= args.gradient_accumulation_steps
+            # else:
+            #     steps_trained_in_current_epoch = 0
+
+            print("  Continuing training from checkpoint, will skip to saved global_step")
+            print(f"  Continuing training from epoch {epochs_trained}")
+            print(f"  Continuing training from global step {self.state.global_step}")
+            if not args.ignore_data_skip:
+                print(
+                    f"  Will skip the first {epochs_trained} epochs then the first"
+                    f" {self.state.episode} batches in the first epoch."
+                )
+
         # Compute absolute values for logging, eval, and save if given as ratio
         if args.logging_steps is not None:
             if args.logging_steps < 1:
@@ -298,7 +380,20 @@ class RLOOTrainer(Trainer):
                 self.state.save_steps = args.save_steps
         self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
 
-        for update in range(1, args.num_total_batches + 1):
+        # copied_episode = self.state.episode.copy()
+        print(f'num_total_batches: {args.num_total_batches}')
+        print(f'target step, {self.state.episode / args.batch_size}')
+        for update in range(1, args.num_total_batches + 1):  # update == step, num_total_batches == max_steps
+            if update < (self.state.episode / args.batch_size): # jump to latest step
+                # Skip episode
+                from accelerate import skip_first_batches
+                # skip_first_batches(iter_dataloader, 1)
+                data = next(iter_dataloader)  # skips a batch
+                continue # skip one outer loop
+            elif update == self.state.episode:
+                self._load_rng_state(resume_from_checkpoint)
+            # elif update == self.state.episode and resume_from_checkpoint is not None and steps_trained_in_current_epoch == 0:
+            #     self._load_rng_state(resume_from_checkpoint) 
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)
             with torch.no_grad():
