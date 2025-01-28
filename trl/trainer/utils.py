@@ -1655,3 +1655,82 @@ def flush_left(mask: torch.Tensor, *tensors: torch.Tensor) -> tuple[torch.Tensor
         return mask
     else:
         return mask, *tensors
+
+def compute_logps_with_prompt_cache(
+    model: torch.nn.Module,
+    prompt_inputs: dict,
+    completion_ids: torch.LongTensor,
+    requires_grad_for_completion: bool = True,
+):
+    """
+    The method will compute the log probabilities of the completion tokens by using the prompt cache.
+    1) Forward pass on the prompt with torch.no_grad() to get `past_key_values`.
+    2) Forward pass (with or without grad) on the completion tokens using that cache.
+    3) Compute per-token log probabilities for the completion.
+    Args:
+        model (nn.Module): A causal LM (transformers.AutoModelForCausalLM) or similar.
+        prompt_inputs (dict): The dict of prompt tensors, e.g. {"input_ids", "attention_mask", ...}.
+        completion_ids (torch.LongTensor): Shape [B*G, completion_len].
+        requires_grad_for_completion (bool): Whether to enable gradient for the completion pass.
+    Returns:
+        per_token_logps (torch.FloatTensor): shape [B*G, completion_len],
+        where per_token_logps[i, t] is the logprob of ith completion's t-th completion token,
+        given all preceding tokens in the prompt + the partial completion up to t-1.
+    """
+
+    # Forward pass over prompt tokens (no grad)
+    with torch.no_grad():
+        prompt_out = model(**prompt_inputs, use_cache=True)
+
+        # Only keep the last prompt logit, immediately convert to log probabilities
+        prompt_last_logps = prompt_out.logits[:, -1:, :].log_softmax(dim=-1)
+
+        # Get the batch size and number of generations
+        B = prompt_inputs["input_ids"].size(0)
+        G = completion_ids.size(0) // B
+
+        # Interleave the last log probs for G times
+        prompt_last_logps = prompt_last_logps.repeat_interleave(G, dim=0)
+
+        # Gather the these log probs as they relates to the first completion token
+        first_completion_token_logps = torch.gather(
+            prompt_last_logps,
+            dim=-1,
+            index=completion_ids[:, :1].unsqueeze(-1)
+        ).squeeze(-1)
+
+        # Free memory explicitly
+        del prompt_last_logps
+
+    # Interleave the past key values for the G times
+    prompt_out.past_key_values.batch_repeat_interleave(G)
+
+    # Forward pass over completion tokens (with or without grad)
+    if requires_grad_for_completion:
+        completion_out = model(
+            input_ids=completion_ids,
+            past_key_values=prompt_out.past_key_values,
+            use_cache=False,
+        )
+    else:
+        with torch.no_grad():
+            completion_out = model(
+                input_ids=completion_ids,
+                past_key_values=prompt_out.past_key_values,
+                use_cache=False,
+            )
+
+    # Get rid of the last logits of the completion
+    logits = completion_out.logits[:, :-1, :]  # [B, completion_len - 1, vocab_size]
+
+    # Convert completions logits to logprobs
+    completion_token_logps = torch.gather(
+        logits.log_softmax(dim=-1),
+        dim=-1,
+        index=completion_ids[:, 1:].unsqueeze(-1)
+    ).squeeze(-1)
+
+    # Concat with the first_completion_token_logps
+    per_token_logps = torch.cat([first_completion_token_logps, completion_token_logps], dim=1)
+
+    return per_token_logps
