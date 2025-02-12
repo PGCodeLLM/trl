@@ -44,6 +44,7 @@ from transformers.utils import is_peft_available
 
 from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from ..import_utils import is_vllm_available
+from ..import_utils import is_ray_available
 from ..models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from .callbacks import SyncRefModelCallback
 from .grpo_config import GRPOConfig
@@ -55,6 +56,12 @@ if is_peft_available():
 
 if is_vllm_available():
     from vllm import LLM, SamplingParams
+
+if is_ray_available():
+    import ray
+    import ray.util.collective as collective
+
+    ray.init(address="auto")
 
 if is_wandb_available():
     import wandb
@@ -287,6 +294,7 @@ class GRPOTrainer(Trainer):
         self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
         self.num_generations = args.num_generations  # = G in the GRPO paper
         self.use_vllm = args.use_vllm
+        self.use_ray = args.use_ray
 
         self.beta = args.beta
 
@@ -340,7 +348,40 @@ class GRPOTrainer(Trainer):
                     "`pip install vllm` to use it."
                 )
 
-            if self.accelerator.is_main_process:
+            if not is_ray_available():
+                raise ImportError(
+                    "ray is not available and `use_ray` is set to True. Please install ray and supporting nccl/cupy libraries with "
+                    "`pip install ray` to use it."
+                )
+
+            if self.use_ray:
+                print(f"=============== USING RAY ============================")
+                # vLLM actors must be started after the trainer process, each vLLM actor may only start on nodes with a specified resource "trl_vllm_engine"
+                num_vllm_engines = os.environ.get("NUM_TRL_VLLM_ENGINES", 1)
+                from vllm_engine import VLLMEngineManager
+                # Run this on the trainer (rank 0 of cyber-4)
+                collective.init_collective_group(
+                    world_size=num_vllm_engines + 1, # Assume trainer occupies rank 0
+                    rank=0,
+                    backend="nccl",
+                    group_name="trl_group"
+                )
+                # Run this on the vllm workers (rank 1-4 of cyber-2)
+                manager = VLLMEngineManager.remote(
+                    model_path=model.name_or_path,
+                    num_engines=num_vllm_engines,
+                    group_name="trl_group",
+                    gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
+                    dtype=self.args.vllm_dtype,
+                    enable_prefix_caching=True,
+                    max_model_len=self.args.vllm_max_model_len,
+                )
+
+                # Obtain individual VLLMEngineActor instances after Ray initializes them
+                self.vllm_engines = ray.get(manager.get_engines.remote())
+                print(f"Launched {len(self.vllm_engines)} vllm instances of {self.model_path}")
+
+            elif self.accelerator.is_main_process:
                 vllm_device = self.args.vllm_device
                 if vllm_device == "auto":
                     vllm_device = f"cuda:{self.accelerator.num_processes}"  # take the next GPU idx
@@ -444,6 +485,27 @@ class GRPOTrainer(Trainer):
         logits = logits[:, -logits_to_keep:]
         return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
 
+    def _move_model_to_vllm(self):
+        with unwrap_model_for_generation(
+            self.model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
+        ) as unwrapped_model:
+            if is_compiled_module(unwrapped_model):
+                state_dict = unwrapped_model._orig_mod.state_dict()
+            else:
+                state_dict = unwrapped_model.state_dict()
+        if self.accelerator.is_main_process:
+            if self.use_ray:
+                layers_and_shapes = {name: tensor.shape for name, tensor in state_dict.items()}
+                # Call update_weights on each engine instance, which broadcasts layers from rank 0 to vllm engine actors
+                self.engine_manager.update_weights.remote(
+                    layers_and_shapes=layers_and_shapes,
+                    dtype=self.args.vllm_dtype,
+                    empty_cache=False
+                )
+            else:
+                llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                llm_model.load_weights(state_dict.items())
+
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
@@ -462,23 +524,23 @@ class GRPOTrainer(Trainer):
         if self.args.use_vllm:
             # First, have main process load weights if needed
             if self.state.global_step != self._last_loaded_step:
-                with unwrap_model_for_generation(
-                    self.model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
-                ) as unwrapped_model:
-                    if is_compiled_module(unwrapped_model):
-                        state_dict = unwrapped_model._orig_mod.state_dict()
-                    else:
-                        state_dict = unwrapped_model.state_dict()
-                if self.accelerator.is_main_process:
-                    llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                    llm_model.load_weights(state_dict.items())
+                self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             all_prompts_text = gather_object(prompts_text)
+            
             if self.accelerator.is_main_process:
-                outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
-                completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+                if self.use_ray:
+                    outputs = self.vllm_manager.generate(
+                        all_prompts_text,
+                        sampling_params=self.sampling_params,
+                        use_tqdm=False
+                    )
+                    completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+                else:
+                    outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
+                    completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
             else:
                 completion_ids = [None] * len(all_prompts_text)
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
